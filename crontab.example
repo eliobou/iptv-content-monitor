@@ -1,0 +1,43 @@
+# ================================================
+# Configuration Cron pour IPTV Monitor
+# ================================================
+#
+# Pour éditer le cron de l'utilisateur pi :
+# crontab -e
+#
+# Ajoutez cette ligne (exécution tous les jours à 7h00) :
+
+0 7 * * * /usr/bin/python3 /home/pi/update_iptv/iptv_monitor.py >> /home/pi/update_iptv/cron.log 2>&1
+
+# ================================================
+# Autres exemples de planification
+# ================================================
+
+# Exécution tous les jours à 8h30
+# 30 8 * * * /usr/bin/python3 /home/pi/update_iptv/iptv_monitor.py
+
+# Exécution deux fois par jour (7h et 19h)
+# 0 7,19 * * * /usr/bin/python3 /home/pi/update_iptv/iptv_monitor.py
+
+# Exécution toutes les 6 heures
+# 0 */6 * * * /usr/bin/python3 /home/pi/update_iptv/iptv_monitor.py
+
+# Exécution tous les lundis à 9h
+# 0 9 * * 1 /usr/bin/python3 /home/pi/update_iptv/iptv_monitor.py
+
+# ================================================
+# Format du cron
+# ================================================
+# Minute (0-59)
+# |  Heure (0-23)
+# |  |  Jour du mois (1-31)
+# |  |  |  Mois (1-12)
+# |  |  |  |  Jour de la semaine (0-7, 0=dimanche)
+# |  |  |  |  |
+# *  *  *  *  *  commande à exécuter
+#
+# Exemples :
+# * : Chaque
+# */n : Tous les n (exemple: */15 = toutes les 15 minutes)
+# n,m : À n et m (exemple: 0,30 = à 0 et 30)
+# n-m : De n à m (exemple: 9-17 = de 9h à 17h)
