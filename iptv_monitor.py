@@ -18,6 +18,7 @@ from email.mime.multipart import MIMEMultipart
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 import sys
+import unicodedata
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 BASE_DIR            = Path("/home/pi/update_iptv")
@@ -26,11 +27,6 @@ PREVIOUS_LIST_FILE  = BASE_DIR / "previous_playlist.m3u"
 CONFIG_FILE         = BASE_DIR / "config.json"
 LOG_FILE            = BASE_DIR / "iptv_monitor.log"
 DB_FILE             = BASE_DIR / "iptv_history.db"
-
-# ─── Constants ────────────────────────────────────────────────────────────────
-EMAIL_MAX_PER_SECTION = 1000   # Max entries displayed per section in email
-ABSENCE_THRESHOLD_DAYS = 3    # Days absent before content is considered "truly new" on return
-                               # or "truly removed" when reporting deletion
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -42,6 +38,17 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Arabic detection helper
+# ─────────────────────────────────────────────────────────────────────────────
+# Unicode Arabic block: U+0600–U+06FF
+_ARABIC_RE = re.compile(r'[\u0600-\u06FF]')
+
+def _contains_arabic(text: str) -> bool:
+    """Returns True if the string contains at least one Arabic character."""
+    return bool(_ARABIC_RE.search(text))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -64,6 +71,10 @@ class M3UEntry:
 
         display_match = re.search(r',([^,]+)$', self.raw_extinf)
         self.display_name = display_match.group(1).strip() if display_match else self.tvg_name
+
+    def has_arabic_name(self) -> bool:
+        """Returns True if the entry's name contains Arabic characters."""
+        return _contains_arabic(self.tvg_name) or _contains_arabic(self.display_name)
 
     def get_normalized_name(self):
         """Normalized name: strips quality tags and language markers for dedup / matching."""
@@ -221,14 +232,14 @@ class HistoryDB:
             f"{len(url_history_rows)} URL history rows"
         )
 
-    def get_truly_removed(self, today_str: str) -> list:
+    def get_truly_removed(self, today_str: str, absence_threshold_days: int) -> list:
         """
-        Returns contents whose last_seen is exactly (today - ABSENCE_THRESHOLD_DAYS).
+        Returns contents whose last_seen is exactly (today - absence_threshold_days).
         These are reported as truly removed today (threshold just crossed).
         """
         threshold_date = (
             datetime.strptime(today_str, "%Y-%m-%d").date()
-            - timedelta(days=ABSENCE_THRESHOLD_DAYS)
+            - timedelta(days=absence_threshold_days)
         ).isoformat()
         rows = self.conn.execute(
             "SELECT * FROM contents WHERE last_seen = ?", (threshold_date,)
@@ -256,6 +267,8 @@ class IPTVMonitor:
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 config = json.load(f)
+
+            # ── Connection settings ───────────────────────────────────────────
             self.iptv_url      = config['iptv_url']
             self.smtp_server   = config['smtp_server']
             self.smtp_port     = config['smtp_port']
@@ -263,10 +276,71 @@ class IPTVMonitor:
             self.smtp_password = config['smtp_password']
             self.email_from    = config['email_from']
             self.email_to      = config['email_to']
-            logger.info("Configuration loaded successfully")
+
+            # ── Formerly hard-coded constants, now read from config ───────────
+            self.email_max_per_section  = config.get('email_max_per_section', 1000)
+            self.absence_threshold_days = config.get('absence_threshold_days', 3)
+
+            # ── Display section toggles (default: new=on, removed=on, url=off) ─
+            display = config.get('display', {})
+            self.show_new         = display.get('show_new', True)
+            self.show_removed     = display.get('show_removed', True)
+            self.show_url_updates = display.get('show_url_updates', False)
+
+            # ── Arabic content filter ─────────────────────────────────────────
+            self.filter_arabic = config.get('filter_arabic', False)
+
+            logger.info(
+                f"Configuration loaded — "
+                f"show_new={self.show_new}, show_removed={self.show_removed}, "
+                f"show_url_updates={self.show_url_updates}, "
+                f"filter_arabic={self.filter_arabic}, "
+                f"absence_threshold={self.absence_threshold_days}d, "
+                f"email_max={self.email_max_per_section}"
+            )
         except Exception as e:
             logger.error(f"Failed to load configuration: {e}")
             raise
+
+    # ── Arabic filter helpers ─────────────────────────────────────────────────
+    def _filter_arabic_entries(self, entries: list) -> list:
+        """
+        Removes M3UEntry objects whose name contains Arabic characters.
+        Only applied when self.filter_arabic is True.
+        """
+        if not self.filter_arabic:
+            return entries
+        filtered = [e for e in entries if not e.has_arabic_name()]
+        removed_count = len(entries) - len(filtered)
+        if removed_count:
+            logger.info(f"Arabic filter: removed {removed_count} entries from list")
+        return filtered
+
+    def _filter_arabic_url_updates(self, url_updates: list) -> list:
+        """
+        Removes (old_url, M3UEntry) pairs whose entry name contains Arabic characters.
+        Only applied when self.filter_arabic is True.
+        """
+        if not self.filter_arabic:
+            return url_updates
+        filtered = [(old_url, e) for old_url, e in url_updates if not e.has_arabic_name()]
+        removed_count = len(url_updates) - len(filtered)
+        if removed_count:
+            logger.info(f"Arabic filter: removed {removed_count} URL-update entries")
+        return filtered
+
+    def _filter_arabic_db_rows(self, db_rows: list) -> list:
+        """
+        Removes DB row dicts whose normalized_name contains Arabic characters.
+        Only applied when self.filter_arabic is True.
+        """
+        if not self.filter_arabic:
+            return db_rows
+        filtered = [r for r in db_rows if not _contains_arabic(r['normalized_name'])]
+        removed_count = len(db_rows) - len(filtered)
+        if removed_count:
+            logger.info(f"Arabic filter: removed {removed_count} removed-content DB rows")
+        return filtered
 
     # ── Download & parse ──────────────────────────────────────────────────────
     def _download_playlist(self):
@@ -348,11 +422,11 @@ class IPTVMonitor:
 
         today_date = date.today()
 
-        truly_new    = []
-        url_updated  = []
-        new_rows     = []      # for DB INSERT
-        updated_rows = []      # for DB UPDATE  (last_seen, url_current, unique_id)
-        url_hist_rows = []     # for url_history INSERT
+        truly_new     = []
+        url_updated   = []
+        new_rows      = []      # for DB INSERT
+        updated_rows  = []      # for DB UPDATE  (last_seen, url_current, unique_id)
+        url_hist_rows = []      # for url_history INSERT
 
         for entry in self.current_entries:
             uid      = entry.get_unique_id()
@@ -379,7 +453,7 @@ class IPTVMonitor:
                 days_absent    = (today_date - last_seen_date).days
                 url_changed    = (existing['url_current'] != entry.url)
 
-                if days_absent > ABSENCE_THRESHOLD_DAYS:
+                if days_absent > self.absence_threshold_days:
                     # Gone long enough → treat as new again
                     truly_new.append(entry)
                 elif url_changed and uid in prev_index:
@@ -391,14 +465,14 @@ class IPTVMonitor:
                 if url_changed:
                     url_hist_rows.append((uid, entry.url, self.today_str))
                 # Refresh cache entry so dupes within the same playlist are idempotent
-                existing['last_seen']    = self.today_str
-                existing['url_current']  = entry.url
+                existing['last_seen']   = self.today_str
+                existing['url_current'] = entry.url
 
         # ── Step 3: flush all changes in one transaction ──────────────────────
         self.db.flush(db_cache, new_rows, updated_rows, url_hist_rows)
 
         # ── Truly removed: one targeted SELECT ───────────────────────────────
-        truly_removed = self.db.get_truly_removed(self.today_str)
+        truly_removed = self.db.get_truly_removed(self.today_str, self.absence_threshold_days)
 
         logger.info(
             f"Smart diff done: {len(truly_new)} new, "
@@ -461,14 +535,11 @@ class IPTVMonitor:
             if ctype in ('TV', 'FILM'):
                 categorized[ctype].append(row)
             elif ctype == 'SERIE':
-                # Reconstruct series grouping from normalized_name
-                # Format stored is "serie_name_season_episode" hashed,
-                # so we use normalized_name which contains the full tvg_name base
                 name = row['normalized_name']
                 ep_match = re.search(r'(S\d{2})\s*(E\d{2})', name, re.IGNORECASE)
                 if ep_match:
-                    season  = ep_match.group(1).upper()
-                    episode = ep_match.group(2).upper()
+                    season     = ep_match.group(1).upper()
+                    episode    = ep_match.group(2).upper()
                     serie_name = re.split(
                         r'S\d{2}\s*E\d{2}', name, flags=re.IGNORECASE
                     )[0].strip()
@@ -480,13 +551,12 @@ class IPTVMonitor:
         return categorized
 
     # ── Limit helpers ─────────────────────────────────────────────────────────
-    @staticmethod
-    def _limit(lst, label):
-        if len(lst) > EMAIL_MAX_PER_SECTION:
+    def _limit(self, lst, label):
+        if len(lst) > self.email_max_per_section:
             logger.warning(
-                f"⚠  {len(lst)} {label} — limiting to {EMAIL_MAX_PER_SECTION} for email"
+                f"⚠  {len(lst)} {label} — limiting to {self.email_max_per_section} for email"
             )
-            return lst[:EMAIL_MAX_PER_SECTION], True
+            return lst[:self.email_max_per_section], True
         return lst, False
 
     # ── HTML rendering ────────────────────────────────────────────────────────
@@ -495,10 +565,10 @@ class IPTVMonitor:
         return f'<span class="quality quality-{quality}">{quality}</span>'
 
     def _render_new_section(self, categorized, total_raw, limited):
-        total_films   = len(categorized['FILM'])
-        total_series  = len(categorized['SERIE'])
-        total_episodes= sum(len(v) for v in categorized['SERIE'].values())
-        total_tv      = len(categorized['TV'])
+        total_films    = len(categorized['FILM'])
+        total_series   = len(categorized['SERIE'])
+        total_episodes = sum(len(v) for v in categorized['SERIE'].values())
+        total_tv       = len(categorized['TV'])
         if total_films + total_series + total_tv == 0:
             return ""
 
@@ -507,13 +577,13 @@ class IPTVMonitor:
         html += (
             '<p class="section-desc">'
             'Contenus jamais vus ou absents depuis plus de '
-            f'{ABSENCE_THRESHOLD_DAYS} jours.'
+            f'{self.absence_threshold_days} jours.'
             '</p>'
         )
         if limited:
             html += (
                 f'<div class="warning">⚠️ {total_raw} ajouts détectés au total. '
-                f'Seuls les {EMAIL_MAX_PER_SECTION} premiers de chaque catégorie '
+                f'Seuls les {self.email_max_per_section} premiers de chaque catégorie '
                 f'sont affichés.</div>'
             )
         html += f'''
@@ -550,10 +620,10 @@ class IPTVMonitor:
         return html
 
     def _render_removed_section(self, categorized, total_raw, limited):
-        total_films   = len(categorized['FILM'])
-        total_series  = len(categorized['SERIE'])
-        total_episodes= sum(len(v) for v in categorized['SERIE'].values())
-        total_tv      = len(categorized['TV'])
+        total_films    = len(categorized['FILM'])
+        total_series   = len(categorized['SERIE'])
+        total_episodes = sum(len(v) for v in categorized['SERIE'].values())
+        total_tv       = len(categorized['TV'])
         if total_films + total_series + total_tv == 0:
             return ""
 
@@ -561,13 +631,13 @@ class IPTVMonitor:
         html += '<h2>🗑️ Suppressions confirmées</h2>'
         html += (
             '<p class="section-desc">'
-            f'Absents depuis {ABSENCE_THRESHOLD_DAYS} jours consécutifs.'
+            f'Absents depuis {self.absence_threshold_days} jours consécutifs.'
             '</p>'
         )
         if limited:
             html += (
                 f'<div class="warning">⚠️ {total_raw} suppressions détectées. '
-                f'Seules les {EMAIL_MAX_PER_SECTION} premières sont affichées.</div>'
+                f'Seules les {self.email_max_per_section} premières sont affichées.</div>'
             )
         html += f'''
         <div class="summary">
@@ -621,7 +691,7 @@ class IPTVMonitor:
         if limited:
             html += (
                 f'<div class="warning">⚠️ {total_raw} mises à jour détectées. '
-                f'Seules les {EMAIL_MAX_PER_SECTION} premières sont affichées.</div>'
+                f'Seules les {self.email_max_per_section} premières sont affichées.</div>'
             )
         html += f'''
         <div class="summary">
@@ -731,49 +801,64 @@ class IPTVMonitor:
         </style>
         """
 
+        # Only show counts for sections that are enabled
+        display_new         = total_new         if self.show_new         else "—"
+        display_removed     = total_removed     if self.show_removed     else "—"
+        display_url_updated = total_url_updated if self.show_url_updates else "—"
+
         parts = [f"""<!DOCTYPE html><html><head><meta charset="UTF-8">{css}</head>
         <body><div class="container">
             <h1>📺 Rapport IPTV</h1>
             <p>Généré le <strong>{datetime.now().strftime("%d/%m/%Y à %H:%M")}</strong></p>
             <div class="global-summary">
                 <div class="gs-card green">
-                    <div class="nb">{total_new}</div>
+                    <div class="nb">{display_new}</div>
                     <div class="label">🆕 Nouveau(x)</div>
                 </div>
                 <div class="gs-card red">
-                    <div class="nb">{total_removed}</div>
+                    <div class="nb">{display_removed}</div>
                     <div class="label">🗑️ Supprimé(s)</div>
                 </div>
                 <div class="gs-card orange">
-                    <div class="nb">{total_url_updated}</div>
+                    <div class="nb">{display_url_updated}</div>
                     <div class="label">🔄 URL mise(s) à jour</div>
                 </div>
             </div>
         """]
 
-        if total_new + total_removed + total_url_updated == 0:
+        # Determine whether there is anything to show given current toggles
+        visible_total = (
+            (total_new         if self.show_new         else 0) +
+            (total_removed     if self.show_removed     else 0) +
+            (total_url_updated if self.show_url_updates else 0)
+        )
+
+        if visible_total == 0:
             parts.append(
                 '<div class="no-change"><p>✅ Aucun changement significatif détecté.</p>'
                 f'<p><small>Les contenus qui disparaissent et réapparaissent dans '
-                f'moins de {ABSENCE_THRESHOLD_DAYS} jours sans changement d\'URL '
+                f'moins de {self.absence_threshold_days} jours sans changement d\'URL '
                 f'sont ignorés.</small></p></div>'
             )
         else:
-            parts.append(
-                self._render_new_section(new_cat, total_new, limited_new)
-            )
-            parts.append(
-                self._render_removed_section(removed_cat, total_removed, limited_removed)
-            )
-            parts.append(
-                self._render_url_updated_section(
-                    url_updated_cat, total_url_updated, limited_url_updated
+            if self.show_new:
+                parts.append(
+                    self._render_new_section(new_cat, total_new, limited_new)
                 )
-            )
+            if self.show_removed:
+                parts.append(
+                    self._render_removed_section(removed_cat, total_removed, limited_removed)
+                )
+            if self.show_url_updates:
+                parts.append(
+                    self._render_url_updated_section(
+                        url_updated_cat, total_url_updated, limited_url_updated
+                    )
+                )
 
         parts.append(
             '<div class="footer">Rapport généré automatiquement par IPTV Monitor'
-            f'<br><small>Seuil de détection : {ABSENCE_THRESHOLD_DAYS} jours</small>'
+            f'<br><small>Seuil de détection : {self.absence_threshold_days} jours</small>'
             '</div></div></body></html>'
         )
         return "".join(parts)
@@ -783,9 +868,9 @@ class IPTVMonitor:
         try:
             msg = MIMEMultipart('alternative')
             parts = []
-            if total_new:         parts.append(f"+{total_new}")
-            if total_removed:     parts.append(f"-{total_removed}")
-            if total_url_updated: parts.append(f"~{total_url_updated}")
+            if total_new         and self.show_new:         parts.append(f"+{total_new}")
+            if total_removed     and self.show_removed:     parts.append(f"-{total_removed}")
+            if total_url_updated and self.show_url_updates: parts.append(f"~{total_url_updated}")
             summary_str = " | ".join(parts) if parts else "Aucun changement"
             msg['Subject'] = (
                 f"📺 IPTV [{summary_str}] – "
@@ -829,14 +914,19 @@ class IPTVMonitor:
             # ── Smart diff ────────────────────────────────────────────────────
             truly_new, url_updated, truly_removed = self._compute_smart_diff()
 
+            # ── Apply Arabic filter (before counting) ─────────────────────────
+            truly_new     = self._filter_arabic_entries(truly_new)
+            url_updated   = self._filter_arabic_url_updates(url_updated)
+            truly_removed = self._filter_arabic_db_rows(truly_removed)
+
             total_new         = len(truly_new)
             total_url_updated = len(url_updated)
             total_removed     = len(truly_removed)
 
             # ── Limit for email ───────────────────────────────────────────────
-            new_for_email,         limited_new         = self._limit(truly_new,    "new items")
-            url_updated_for_email, limited_url_updated = self._limit(url_updated,  "URL updates")
-            removed_for_email,     limited_removed     = self._limit(truly_removed,"removals")
+            new_for_email,         limited_new         = self._limit(truly_new,     "new items")
+            url_updated_for_email, limited_url_updated = self._limit(url_updated,   "URL updates")
+            removed_for_email,     limited_removed     = self._limit(truly_removed, "removals")
 
             # ── Categorize ────────────────────────────────────────────────────
             logger.info("Categorizing changes...")

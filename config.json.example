@@ -1,0 +1,23 @@
+{
+    "iptv_url": "http://<IP>/get.php?username=USERNAME&password=PASSWORD&type=m3u_plus&output=ts",
+    "smtp_server": "smtp.gmail.com",
+    "smtp_port": 587,
+    "smtp_user": "votre_email@gmail.com",
+    "smtp_password": "votre_mot_de_passe_application",
+    "email_from": "votre_email@gmail.com",
+    "email_to": [
+        "destinataire1@example.com",
+        "destinataire2@example.com"
+    ],
+
+    "absence_threshold_days": 3,
+    "email_max_per_section": 1000,
+
+    "display": {
+        "show_new": true,
+        "show_removed": true,
+        "show_url_updates": false
+    },
+
+    "filter_arabic": true
+}

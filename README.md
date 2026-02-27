@@ -1,4 +1,4 @@
-# 📺 IPTV Monitor
+# IPTV Content Monitor
 
 A Python script that automatically monitors your M3U IPTV playlist, detects new content and sends you a daily HTML email summary.
 
@@ -8,12 +8,14 @@ A Python script that automatically monitors your M3U IPTV playlist, detects new 
 
 - ✅ Automatic playlist download and parsing
 - ✅ Smart new-content detection via local SQLite history database
-- ✅ Filters out provider playlist rebuilds (no more thousands of false positives)
-- ✅ Confirmed removal alerts after 3 consecutive days of absence
+- ✅ Filters out provider playlist rebuilds (no thousands of false positives)
+- ✅ Confirmed removal alerts after a configurable number of consecutive days of absence
 - ✅ URL-change detection (same content, new streaming address)
 - ✅ Quality deduplication — same film in SD/HD/FHD/4K counted once, best quality shown
 - ✅ Auto-categorisation: Films, Series, TV Channels
 - ✅ Responsive HTML email with colour-coded quality badges
+- ✅ Configurable email sections — independently enable/disable New, Removed and URL-update sections
+- ✅ Optional Arabic content filter — silently excludes entries with Arabic names from all sections and counters
 - ✅ Multiple recipients support
 - ✅ Scheduled execution via cron
 
@@ -32,10 +34,10 @@ IPTV Monitor maintains a local SQLite database of every content item ever seen. 
 | Event | Condition | Email report |
 |-------|-----------|--------------|
 | 🆕 New content | Never seen in DB | ✅ Shown |
-| 🆕 Returning content | Absent for more than 3 days | ✅ Shown |
+| 🆕 Returning content | Absent for more than `absence_threshold_days` days | ✅ Shown |
 | 🔄 URL update | Present yesterday & today, URL changed | ✅ Shown |
-| 🗑️ True removal | Absent for exactly 3 consecutive days | ✅ Shown |
-| *(silence)* | Disappears & reappears within 3 days, same URL | ❌ Ignored |
+| 🗑️ True removal | Absent for exactly `absence_threshold_days` consecutive days | ✅ Shown |
+| *(silence)* | Disappears & reappears within threshold, same URL | ❌ Ignored |
 
 ### Content Identification
 
@@ -53,12 +55,9 @@ Each item is assigned a stable ID based on its **normalised name** — quality t
 ## Installation
 
 ```bash
-# Create working directory
-sudo mkdir -p /home/pi/update_iptv
-sudo chown -R pi:pi /home/pi/update_iptv
-cd /home/pi/update_iptv
+# Clone repo
 
-# Copy iptv_monitor.py here, then make it executable
+# Make iptv_monitor.py executable
 chmod +x iptv_monitor.py
 ```
 
@@ -66,22 +65,16 @@ chmod +x iptv_monitor.py
 
 ## Configuration
 
-Update `config.json`:
+- Update `config.json` :
 
-```json
-{
-    "iptv_url": "http://your-provider.com/get.php?username=USER&password=PASS&type=m3u_plus",
-    "smtp_server": "smtp.gmail.com",
-    "smtp_port": 587,
-    "smtp_user": "your_email@gmail.com",
-    "smtp_password": "xxxx xxxx xxxx xxxx",
-    "email_from": "your_email@gmail.com",
-    "email_to": [
-        "recipient1@example.com",
-        "recipient2@example.com"
-    ]
-}
-```
+| Key                        | Default | Description                                                                                                     |
+| -------------------------- | ------- | --------------------------------------------------------------------------------------------------------------- |
+| `absence_threshold_days`   | `3`     | Days of absence before content is considered truly removed or truly new on return                               |
+| `email_max_per_section`    | `1000`  | Maximum number of entries displayed per section in the email                                                    |
+| `display.show_new`         | `true`  | Include the New Content section in the email                                                                    |
+| `display.show_removed`     | `true`  | Include the Confirmed Removals section in the email                                                             |
+| `display.show_url_updates` | `false` | Include the URL Updates section in the email                                                                    |
+| `filter_arabic`            | `false` | When `true`, entries whose name contains Arabic characters are silently excluded from all sections and counters |
 
 > ⚠️ **This file contains your passwords — never commit it.**
 > ```bash
@@ -143,16 +136,10 @@ config.json
 
 ## Email Report
 
-The HTML email contains three sections:
+The HTML email contains up to three sections, each independently toggleable via `config.json`:
 
-- **🆕 New content** — films, series episodes and TV channels never seen before or returning after 3+ days
-- **🗑️ Confirmed removals** — content absent for 3 consecutive days
-- **🔄 URL updates** — same content, new streaming address
+- **🆕 New content** — films, series episodes and TV channels never seen before or returning after the configured threshold
+- **🗑️ Confirmed removals** — content absent for the configured number of consecutive days
+- **🔄 URL updates** — same content, new streaming address (disabled by default)
 
-Each section groups content by type (Films / Series / TV Channels) and shows quality badges (SD / HD / FHD / 4K). Up to 1,000 items per section are displayed.
-
----
-
-## License
-
-Provided as-is, free to modify for personal use.
+Each section groups content by type (Films / Series / TV Channels) and shows quality badges (SD / HD / FHD / 4K). The number of items per section is capped by `email_max_per_section`.
