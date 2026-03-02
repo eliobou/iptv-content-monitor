@@ -21,7 +21,7 @@ import sys
 import unicodedata
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
-BASE_DIR            = Path("/home/pi/update_iptv")
+BASE_DIR            = Path(__file__).parent
 CURRENT_LIST_FILE   = BASE_DIR / "current_playlist.m3u"
 PREVIOUS_LIST_FILE  = BASE_DIR / "previous_playlist.m3u"
 CONFIG_FILE         = BASE_DIR / "config.json"
