@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 IPTV Monitor - Monitors IPTV playlist updates
-Detects additions, removals and URL changes, then sends an email summary.
+Detects additions and removals, then sends an email summary.
 Uses a local SQLite DB to distinguish real new content from playlist rebuilds.
 """
 import re
@@ -18,7 +18,6 @@ from email.mime.multipart import MIMEMultipart
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 import sys
-import unicodedata
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 BASE_DIR            = Path(__file__).parent
@@ -113,8 +112,7 @@ class M3UEntry:
 
     def get_unique_id(self):
         """
-        Stable ID based on normalized name only (not URL).
-        Allows detecting URL changes on the same content.
+        Stable ID based on normalized name only.
         For series: based on serie_name + season + episode.
         """
         if self.get_content_type() == "SERIE":
@@ -138,9 +136,10 @@ class HistoryDB:
     """
     SQLite database that tracks every piece of content ever seen.
 
-    Tables:
-      - contents    : one row per unique_id
-      - url_history : one row per URL change per content
+    Table:
+      - contents : one row per unique_id (first_seen, last_seen, appearance_count)
+
+    No URL tracking — only presence/absence matters.
 
     Performance strategy:
       - load_all()         : pulls the entire contents table into a dict in one query
@@ -165,22 +164,11 @@ class HistoryDB:
                 content_type     TEXT NOT NULL,
                 first_seen       TEXT NOT NULL,   -- ISO date YYYY-MM-DD
                 last_seen        TEXT NOT NULL,   -- ISO date YYYY-MM-DD
-                url_current      TEXT NOT NULL,
                 appearance_count INTEGER NOT NULL DEFAULT 1
-            );
-
-            CREATE TABLE IF NOT EXISTS url_history (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                unique_id   TEXT NOT NULL,
-                url         TEXT NOT NULL,
-                seen_on     TEXT NOT NULL,   -- ISO date YYYY-MM-DD
-                FOREIGN KEY (unique_id) REFERENCES contents(unique_id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_contents_last_seen
                 ON contents(last_seen);
-            CREATE INDEX IF NOT EXISTS idx_url_history_uid
-                ON url_history(unique_id);
         """)
         self.conn.commit()
 
@@ -193,43 +181,35 @@ class HistoryDB:
         logger.info(f"DB loaded: {len(rows)} known entries")
         return {r['unique_id']: dict(r) for r in rows}
 
-    def flush(self, cache: dict, new_rows: list, updated_rows: list, url_history_rows: list):
+    def flush(self, cache: dict, new_rows: list, updated_rows: list):
         """
         Writes all changes in a single transaction.
 
         Args:
-            cache            : full in-memory DB (unused here, kept for clarity)
-            new_rows         : list of dicts ready for INSERT into contents
-            updated_rows     : list of (last_seen, url_current, unique_id) for UPDATE
-            url_history_rows : list of (unique_id, url, seen_on) for INSERT into url_history
+            cache        : full in-memory DB (unused here, kept for clarity)
+            new_rows     : list of dicts ready for INSERT into contents
+            updated_rows : list of (last_seen, unique_id) for UPDATE
         """
         with self.conn:   # automatic commit / rollback
             if new_rows:
                 self.conn.executemany(
                     """INSERT OR IGNORE INTO contents
                        (unique_id, normalized_name, content_type,
-                        first_seen, last_seen, url_current, appearance_count)
+                        first_seen, last_seen, appearance_count)
                        VALUES (:unique_id, :normalized_name, :content_type,
-                               :first_seen, :last_seen, :url_current, 1)""",
+                               :first_seen, :last_seen, 1)""",
                     new_rows
                 )
             if updated_rows:
                 self.conn.executemany(
                     """UPDATE contents
-                       SET last_seen = ?, url_current = ?,
+                       SET last_seen = ?,
                            appearance_count = appearance_count + 1
                        WHERE unique_id = ?""",
                     updated_rows
                 )
-            if url_history_rows:
-                self.conn.executemany(
-                    "INSERT INTO url_history (unique_id, url, seen_on) VALUES (?, ?, ?)",
-                    url_history_rows
-                )
         logger.info(
-            f"DB flushed: {len(new_rows)} inserts, "
-            f"{len(updated_rows)} updates, "
-            f"{len(url_history_rows)} URL history rows"
+            f"DB flushed: {len(new_rows)} inserts, {len(updated_rows)} updates"
         )
 
     def get_truly_removed(self, today_str: str, absence_threshold_days: int) -> list:
@@ -281,11 +261,10 @@ class IPTVMonitor:
             self.email_max_per_section  = config.get('email_max_per_section', 1000)
             self.absence_threshold_days = config.get('absence_threshold_days', 3)
 
-            # ── Display section toggles (default: new=on, removed=on, url=off) ─
+            # ── Display section toggles (default: new=on, removed=on) ─────────
             display = config.get('display', {})
-            self.show_new         = display.get('show_new', True)
-            self.show_removed     = display.get('show_removed', True)
-            self.show_url_updates = display.get('show_url_updates', False)
+            self.show_new     = display.get('show_new', True)
+            self.show_removed = display.get('show_removed', True)
 
             # ── Arabic content filter ─────────────────────────────────────────
             self.filter_arabic = config.get('filter_arabic', False)
@@ -293,7 +272,6 @@ class IPTVMonitor:
             logger.info(
                 f"Configuration loaded — "
                 f"show_new={self.show_new}, show_removed={self.show_removed}, "
-                f"show_url_updates={self.show_url_updates}, "
                 f"filter_arabic={self.filter_arabic}, "
                 f"absence_threshold={self.absence_threshold_days}d, "
                 f"email_max={self.email_max_per_section}"
@@ -314,19 +292,6 @@ class IPTVMonitor:
         removed_count = len(entries) - len(filtered)
         if removed_count:
             logger.info(f"Arabic filter: removed {removed_count} entries from list")
-        return filtered
-
-    def _filter_arabic_url_updates(self, url_updates: list) -> list:
-        """
-        Removes (old_url, M3UEntry) pairs whose entry name contains Arabic characters.
-        Only applied when self.filter_arabic is True.
-        """
-        if not self.filter_arabic:
-            return url_updates
-        filtered = [(old_url, e) for old_url, e in url_updates if not e.has_arabic_name()]
-        removed_count = len(url_updates) - len(filtered)
-        if removed_count:
-            logger.info(f"Arabic filter: removed {removed_count} URL-update entries")
         return filtered
 
     def _filter_arabic_db_rows(self, db_rows: list) -> list:
@@ -407,9 +372,8 @@ class IPTVMonitor:
           2. Diff all current entries against in-memory dict
           3. Write all changes in one transaction (1 bulk INSERT/UPDATE)
 
-        Returns (truly_new, url_updated, truly_removed):
+        Returns (truly_new, truly_removed):
           - truly_new    : list of M3UEntry  — never seen OR absent > threshold
-          - url_updated  : list of (old_url: str, entry: M3UEntry)
           - truly_removed: list of DB row dicts — threshold crossed today
         """
         logger.info("Computing smart diff against history DB (bulk mode)...")
@@ -417,16 +381,11 @@ class IPTVMonitor:
         # ── Step 1: load full DB cache in one query ───────────────────────────
         db_cache = self.db.load_all()
 
-        # ── Step 2: index of previous playlist for URL-change detection ───────
-        prev_index = {e.get_unique_id(): e for e in self.previous_entries}
-
         today_date = date.today()
 
-        truly_new     = []
-        url_updated   = []
-        new_rows      = []      # for DB INSERT
-        updated_rows  = []      # for DB UPDATE  (last_seen, url_current, unique_id)
-        url_hist_rows = []      # for url_history INSERT
+        truly_new    = []
+        new_rows     = []   # for DB INSERT
+        updated_rows = []   # for DB UPDATE (last_seen, unique_id)
 
         for entry in self.current_entries:
             uid      = entry.get_unique_id()
@@ -435,51 +394,41 @@ class IPTVMonitor:
             if existing is None:
                 # ── Brand new: never in DB ────────────────────────────────────
                 truly_new.append(entry)
-                new_rows.append({
+                new_row = {
                     'unique_id':       uid,
                     'normalized_name': entry.get_normalized_name(),
                     'content_type':    entry.get_content_type(),
                     'first_seen':      self.today_str,
                     'last_seen':       self.today_str,
-                    'url_current':     entry.url,
-                })
-                url_hist_rows.append((uid, entry.url, self.today_str))
+                }
+                new_rows.append(new_row)
                 # Update cache so duplicate entries in the same playlist don't
                 # produce double inserts
-                db_cache[uid] = new_rows[-1]
+                db_cache[uid] = new_row
             else:
-                # ── Known content: check days absent and URL change ───────────
+                # ── Known content: check days absent ─────────────────────────
                 last_seen_date = datetime.strptime(existing['last_seen'], "%Y-%m-%d").date()
                 days_absent    = (today_date - last_seen_date).days
-                url_changed    = (existing['url_current'] != entry.url)
 
                 if days_absent > self.absence_threshold_days:
                     # Gone long enough → treat as new again
                     truly_new.append(entry)
-                elif url_changed and uid in prev_index:
-                    # Present yesterday + today but URL changed
-                    url_updated.append((existing['url_current'], entry))
 
-                # Always update last_seen and url in DB
-                updated_rows.append((self.today_str, entry.url, uid))
-                if url_changed:
-                    url_hist_rows.append((uid, entry.url, self.today_str))
+                # Always update last_seen in DB
+                updated_rows.append((self.today_str, uid))
                 # Refresh cache entry so dupes within the same playlist are idempotent
-                existing['last_seen']   = self.today_str
-                existing['url_current'] = entry.url
+                existing['last_seen'] = self.today_str
 
-        # ── Step 3: flush all changes in one transaction ──────────────────────
-        self.db.flush(db_cache, new_rows, updated_rows, url_hist_rows)
+        # ── Step 2: flush all changes in one transaction ──────────────────────
+        self.db.flush(db_cache, new_rows, updated_rows)
 
         # ── Truly removed: one targeted SELECT ───────────────────────────────
         truly_removed = self.db.get_truly_removed(self.today_str, self.absence_threshold_days)
 
         logger.info(
-            f"Smart diff done: {len(truly_new)} new, "
-            f"{len(url_updated)} URL updates, "
-            f"{len(truly_removed)} truly removed"
+            f"Smart diff done: {len(truly_new)} new, {len(truly_removed)} truly removed"
         )
-        return truly_new, url_updated, truly_removed
+        return truly_new, truly_removed
 
     # ── Categorization ────────────────────────────────────────────────────────
     @staticmethod
@@ -509,22 +458,6 @@ class IPTVMonitor:
                 if serie_name:
                     categorized['SERIE'].setdefault(serie_name, [])
                     categorized['SERIE'][serie_name].append((season, episode, entry))
-        return categorized
-
-    def _categorize_url_updates(self, url_updates):
-        """Groups (old_url, entry) pairs into TV / FILM / SERIE."""
-        categorized = {'TV': [], 'FILM': [], 'SERIE': {}}
-        for old_url, entry in url_updates:
-            ctype = entry.get_content_type()
-            if ctype == "TV":
-                categorized['TV'].append((old_url, entry))
-            elif ctype == "FILM":
-                categorized['FILM'].append((old_url, entry))
-            elif ctype == "SERIE":
-                serie_name, season, episode = entry.get_serie_info()
-                if serie_name:
-                    categorized['SERIE'].setdefault(serie_name, [])
-                    categorized['SERIE'][serie_name].append((season, episode, old_url, entry))
         return categorized
 
     def _categorize_removed_db_rows(self, db_rows):
@@ -673,75 +606,11 @@ class IPTVMonitor:
         html += '</div>'
         return html
 
-    def _render_url_updated_section(self, categorized, total_raw, limited):
-        total_films  = len(categorized['FILM'])
-        total_series = len(categorized['SERIE'])
-        total_tv     = len(categorized['TV'])
-        if total_films + total_series + total_tv == 0:
-            return ""
-
-        html  = '<div class="section section-modified">'
-        html += '<h2>🔄 Mises à jour d\'URL</h2>'
-        html += (
-            '<p class="section-desc">'
-            'Ces contenus sont toujours disponibles mais leur URL de streaming a changé. '
-            'Pensez à rafraîchir votre lecteur.'
-            '</p>'
-        )
-        if limited:
-            html += (
-                f'<div class="warning">⚠️ {total_raw} mises à jour détectées. '
-                f'Seules les {self.email_max_per_section} premières sont affichées.</div>'
-            )
-        html += f'''
-        <div class="summary">
-            <span class="summary-item">🎬 Films : <span class="count">{total_films}</span></span>
-            <span class="summary-item">📺 Séries : <span class="count">{total_series} séries</span></span>
-            <span class="summary-item">📡 Chaînes TV : <span class="count">{total_tv}</span></span>
-        </div>'''
-
-        if categorized['FILM']:
-            html += '<h3>🎬 Films</h3><ul>'
-            for old_url, entry in sorted(
-                categorized['FILM'], key=lambda x: x[1].display_name
-            ):
-                html += (
-                    f'<li>{entry.display_name} '
-                    f'{self._quality_badge(entry.get_quality())}</li>'
-                )
-            html += '</ul>'
-
-        if categorized['SERIE']:
-            html += '<h3>📺 Séries</h3>'
-            for serie_name in sorted(categorized['SERIE']):
-                eps = sorted(
-                    categorized['SERIE'][serie_name], key=lambda x: (x[0], x[1])
-                )
-                eps_list = ", ".join(f"{s}{e}" for s, e, _, __ in eps)
-                html += (
-                    f'<div class="serie-block"><strong>{serie_name}</strong>'
-                    f'<span class="serie-episodes"> → {eps_list}</span></div>'
-                )
-
-        if categorized['TV']:
-            html += '<h3>📡 Chaînes TV</h3><ul>'
-            for old_url, entry in sorted(
-                categorized['TV'], key=lambda x: x[1].display_name
-            ):
-                html += (
-                    f'<li>{entry.display_name} '
-                    f'{self._quality_badge(entry.get_quality())}</li>'
-                )
-            html += '</ul>'
-
-        html += '</div>'
-        return html
-
     def _generate_html_email(
         self,
-        new_cat, removed_cat, url_updated_cat,
-        total_new, total_removed, total_url_updated,
-        limited_new, limited_removed, limited_url_updated
+        new_cat, removed_cat,
+        total_new, total_removed,
+        limited_new, limited_removed
     ):
         css = """
         <style>
@@ -759,7 +628,6 @@ class IPTVMonitor:
                        border: 1px solid #e0e0e0; padding: 15px 20px; }
             .section-added   h2 { background: #27ae60; }
             .section-removed h2 { background: #c0392b; }
-            .section-modified h2 { background: #e67e22; }
             .section-desc { color: #7f8c8d; font-style: italic;
                             margin: 4px 0 10px 0; font-size: 0.9em; }
             .summary { background: #f8f9fa; padding: 12px 15px; border-radius: 5px;
@@ -771,7 +639,6 @@ class IPTVMonitor:
                  border-left: 3px solid #bdc3c7; border-radius: 3px; }
             .section-added   li { border-left-color: #27ae60; }
             .section-removed li { border-left-color: #c0392b; }
-            .section-modified li { border-left-color: #e67e22; }
             .quality { display: inline-block; padding: 1px 7px; border-radius: 3px;
                        font-size: 0.8em; font-weight: bold; margin-left: 8px; }
             .quality-4K, .quality-UHD { background: #e74c3c; color: white; }
@@ -783,13 +650,11 @@ class IPTVMonitor:
             .serie-episodes { color: #7f8c8d; font-size: 0.9em; }
             .global-summary { display: flex; gap: 15px; margin-bottom: 20px; }
             .gs-card { flex: 1; text-align: center; padding: 15px; border-radius: 6px; }
-            .gs-card.green  { background: #eafaf1; border: 1px solid #27ae60; }
-            .gs-card.red    { background: #fdedec; border: 1px solid #c0392b; }
-            .gs-card.orange { background: #fef9e7; border: 1px solid #e67e22; }
+            .gs-card.green { background: #eafaf1; border: 1px solid #27ae60; }
+            .gs-card.red   { background: #fdedec; border: 1px solid #c0392b; }
             .gs-card .nb { font-size: 2em; font-weight: bold; }
-            .gs-card.green  .nb { color: #27ae60; }
-            .gs-card.red    .nb { color: #c0392b; }
-            .gs-card.orange .nb { color: #e67e22; }
+            .gs-card.green .nb { color: #27ae60; }
+            .gs-card.red   .nb { color: #c0392b; }
             .gs-card .label { font-size: 0.9em; color: #555; }
             .warning { background: #fff3cd; border-left: 4px solid #f39c12;
                        padding: 10px 15px; margin-bottom: 15px;
@@ -801,10 +666,8 @@ class IPTVMonitor:
         </style>
         """
 
-        # Only show counts for sections that are enabled
-        display_new         = total_new         if self.show_new         else "—"
-        display_removed     = total_removed     if self.show_removed     else "—"
-        display_url_updated = total_url_updated if self.show_url_updates else "—"
+        display_new     = total_new     if self.show_new     else "—"
+        display_removed = total_removed if self.show_removed else "—"
 
         parts = [f"""<!DOCTYPE html><html><head><meta charset="UTF-8">{css}</head>
         <body><div class="container">
@@ -819,42 +682,25 @@ class IPTVMonitor:
                     <div class="nb">{display_removed}</div>
                     <div class="label">🗑️ Supprimé(s)</div>
                 </div>
-                <div class="gs-card orange">
-                    <div class="nb">{display_url_updated}</div>
-                    <div class="label">🔄 URL mise(s) à jour</div>
-                </div>
             </div>
         """]
 
-        # Determine whether there is anything to show given current toggles
         visible_total = (
-            (total_new         if self.show_new         else 0) +
-            (total_removed     if self.show_removed     else 0) +
-            (total_url_updated if self.show_url_updates else 0)
+            (total_new     if self.show_new     else 0) +
+            (total_removed if self.show_removed else 0)
         )
 
         if visible_total == 0:
             parts.append(
                 '<div class="no-change"><p>✅ Aucun changement significatif détecté.</p>'
                 f'<p><small>Les contenus qui disparaissent et réapparaissent dans '
-                f'moins de {self.absence_threshold_days} jours sans changement d\'URL '
-                f'sont ignorés.</small></p></div>'
+                f'moins de {self.absence_threshold_days} jours sont ignorés.</small></p></div>'
             )
         else:
             if self.show_new:
-                parts.append(
-                    self._render_new_section(new_cat, total_new, limited_new)
-                )
+                parts.append(self._render_new_section(new_cat, total_new, limited_new))
             if self.show_removed:
-                parts.append(
-                    self._render_removed_section(removed_cat, total_removed, limited_removed)
-                )
-            if self.show_url_updates:
-                parts.append(
-                    self._render_url_updated_section(
-                        url_updated_cat, total_url_updated, limited_url_updated
-                    )
-                )
+                parts.append(self._render_removed_section(removed_cat, total_removed, limited_removed))
 
         parts.append(
             '<div class="footer">Rapport généré automatiquement par IPTV Monitor'
@@ -864,13 +710,12 @@ class IPTVMonitor:
         return "".join(parts)
 
     # ── Email sending ─────────────────────────────────────────────────────────
-    def _send_email(self, html_content, total_new, total_removed, total_url_updated):
+    def _send_email(self, html_content, total_new, total_removed):
         try:
             msg = MIMEMultipart('alternative')
             parts = []
-            if total_new         and self.show_new:         parts.append(f"+{total_new}")
-            if total_removed     and self.show_removed:     parts.append(f"-{total_removed}")
-            if total_url_updated and self.show_url_updates: parts.append(f"~{total_url_updated}")
+            if total_new     and self.show_new:     parts.append(f"+{total_new}")
+            if total_removed and self.show_removed: parts.append(f"-{total_removed}")
             summary_str = " | ".join(parts) if parts else "Aucun changement"
             msg['Subject'] = (
                 f"📺 IPTV [{summary_str}] – "
@@ -901,47 +746,54 @@ class IPTVMonitor:
 
             # ── First run: build DB reference, no email ───────────────────────
             if not self.previous_entries:
-                logger.info(
-                    "⚠  First run: building reference DB, no email sent"
-                )
+                logger.info("⚠  First run: building reference DB, no email sent")
+                db_cache  = self.db.load_all()
+                new_rows  = []
                 for entry in self.current_entries:
-                    self.db.upsert(entry, self.today_str)
+                    uid = entry.get_unique_id()
+                    if uid not in db_cache:
+                        new_row = {
+                            'unique_id':       uid,
+                            'normalized_name': entry.get_normalized_name(),
+                            'content_type':    entry.get_content_type(),
+                            'first_seen':      self.today_str,
+                            'last_seen':       self.today_str,
+                        }
+                        new_rows.append(new_row)
+                        db_cache[uid] = new_row
+                self.db.flush(db_cache, new_rows, [])
                 self._save_playlist(current_content, CURRENT_LIST_FILE)
                 self._save_playlist(current_content, PREVIOUS_LIST_FILE)
                 logger.info("=== IPTV Monitor done ===")
                 return
 
             # ── Smart diff ────────────────────────────────────────────────────
-            truly_new, url_updated, truly_removed = self._compute_smart_diff()
+            truly_new, truly_removed = self._compute_smart_diff()
 
             # ── Apply Arabic filter (before counting) ─────────────────────────
             truly_new     = self._filter_arabic_entries(truly_new)
-            url_updated   = self._filter_arabic_url_updates(url_updated)
             truly_removed = self._filter_arabic_db_rows(truly_removed)
 
-            total_new         = len(truly_new)
-            total_url_updated = len(url_updated)
-            total_removed     = len(truly_removed)
+            total_new     = len(truly_new)
+            total_removed = len(truly_removed)
 
             # ── Limit for email ───────────────────────────────────────────────
-            new_for_email,         limited_new         = self._limit(truly_new,     "new items")
-            url_updated_for_email, limited_url_updated = self._limit(url_updated,   "URL updates")
-            removed_for_email,     limited_removed     = self._limit(truly_removed, "removals")
+            new_for_email,     limited_new     = self._limit(truly_new,     "new items")
+            removed_for_email, limited_removed = self._limit(truly_removed, "removals")
 
             # ── Categorize ────────────────────────────────────────────────────
             logger.info("Categorizing changes...")
-            new_cat         = self._categorize_entries(new_for_email)
-            url_updated_cat = self._categorize_url_updates(url_updated_for_email)
-            removed_cat     = self._categorize_removed_db_rows(removed_for_email)
+            new_cat     = self._categorize_entries(new_for_email)
+            removed_cat = self._categorize_removed_db_rows(removed_for_email)
 
             # ── Generate and send email ───────────────────────────────────────
             logger.info("Generating email...")
             html = self._generate_html_email(
-                new_cat, removed_cat, url_updated_cat,
-                total_new, total_removed, total_url_updated,
-                limited_new, limited_removed, limited_url_updated
+                new_cat, removed_cat,
+                total_new, total_removed,
+                limited_new, limited_removed
             )
-            self._send_email(html, total_new, total_removed, total_url_updated)
+            self._send_email(html, total_new, total_removed)
 
             # ── Rotate playlist files ─────────────────────────────────────────
             if CURRENT_LIST_FILE.exists():
